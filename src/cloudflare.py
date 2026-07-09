@@ -10,31 +10,33 @@ def create_list(name, domains):
     endpoint = "/lists"
     data = {
         "name": name,
-        "description": "Ads & Tracking Domains",
+        "description": "Managed by Cloudflare-Gateway-DNS-Filter",
         "type": "DOMAIN",
         "items": [{"value": domain} for domain in domains]
     }
     status, response = cloudflare_gateway_request("POST", endpoint, body=json.dumps(data))
     return response["result"]
 
+
 @retry(**retry_config)
 @rate_limited_request
 def update_list(list_id, remove_items, append_items):
-    endpoint = f"/lists/{list_id}"    
+    endpoint = f"/lists/{list_id}"
     data = {
         "remove": [domain for domain in remove_items],
         "append": [{"value": domain} for domain in append_items]
-    }    
+    }
     status, response = cloudflare_gateway_request("PATCH", endpoint, body=json.dumps(data))
     return response["result"]
 
+
 @retry(**retry_config)
-def create_rule(rule_name, list_ids, priority=1000):
+def create_rule(rule_name, list_ids, action="block", priority=1000):
     endpoint = "/rules"
     data = {
         "name": rule_name,
-        "description": "Block Ads & Tracking",
-        "action": "block",
+        "description": f"Managed by Cloudflare-Gateway-DNS-Filter ({action})",
+        "action": action,
         "precedence": priority,
         "traffic": " or ".join(f'any(dns.domains[*] in ${lst})' for lst in list_ids),
         "enabled": True,
@@ -42,13 +44,14 @@ def create_rule(rule_name, list_ids, priority=1000):
     status, response = cloudflare_gateway_request("POST", endpoint, body=json.dumps(data))
     return response["result"]
 
+
 @retry(**retry_config)
-def update_rule(rule_name, rule_id, list_ids, priority=1000):
+def update_rule(rule_name, rule_id, list_ids, action="block", priority=1000):
     endpoint = f"/rules/{rule_id}"
     data = {
         "name": rule_name,
-        "description": "Block Ads & Tracking",
-        "action": "block",
+        "description": f"Managed by Cloudflare-Gateway-DNS-Filter ({action})",
+        "action": action,
         "precedence": priority,
         "traffic": " or ".join(f'any(dns.domains[*] in ${lst})' for lst in list_ids),
         "enabled": True,
@@ -63,11 +66,13 @@ def get_lists(prefix_name):
     lists = response["result"] or []
     return [l for l in lists if l["name"].startswith(prefix_name)]
 
+
 @retry(**retry_config)
 def get_rules(rule_name_prefix):
     status, response = cloudflare_gateway_request("GET", "/rules")
     rules = response["result"] or []
     return [r for r in rules if r["name"].startswith(rule_name_prefix)]
+
 
 @retry(**retry_config)
 @rate_limited_request
@@ -76,11 +81,13 @@ def delete_list(list_id):
     status, response = cloudflare_gateway_request("DELETE", endpoint)
     return response["result"]
 
+
 @retry(**retry_config)
 def delete_rule(rule_id):
     endpoint = f"/rules/{rule_id}"
     status, response = cloudflare_gateway_request("DELETE", endpoint)
     return response["result"]
+
 
 @retry(**retry_config)
 def get_list_items(list_id):

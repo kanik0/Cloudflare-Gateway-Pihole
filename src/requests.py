@@ -18,6 +18,13 @@ class HTTPException(Exception):
 class RateLimitException(HTTPException):
     pass
 
+class NotFoundException(HTTPException):
+    """Raised on 404: the list/rule id in our cache no longer exists on
+    Cloudflare (e.g. deleted manually from the dashboard). Recoverable —
+    callers should evict the stale id from cache and recreate the resource
+    instead of treating this as a fatal error."""
+    pass
+
 # Cloudflare Gateway Request Function
 def cloudflare_gateway_request(
     method: str, endpoint: str,
@@ -63,7 +70,10 @@ def cloudflare_gateway_request(
             if status == 429:
                 silent_error(error_message)
                 raise RateLimitException(error_message)
-            elif status in [400, 403, 404]:
+            elif status == 404:
+                silent_error(error_message)
+                raise NotFoundException(error_message)
+            elif status in [400, 403]:
                 error(error_message)
             else:
                 silent_error(error_message)
@@ -108,6 +118,10 @@ def retry(stop=None, wait=None, retry=None, after=None, before_sleep=None):
                 try:
                     attempt_number += 1
                     return func(*args, **kwargs)
+                except NotFoundException:
+                    # Not transient — raise immediately so the caller can
+                    # evict the stale id from cache and self-heal.
+                    raise
                 except RateLimitException as e:
                     if not first_rate_limit_encountered:
                         # First time meeting 429, delay 2 minutes
