@@ -30,11 +30,8 @@ def update_list(list_id, remove_items, append_items):
     return response["result"]
 
 
-@retry(**retry_config)
-def create_rule(rule_name, list_ids, action="block", priority=1000,
-                 filters=None, traffic_field="dns.domains"):
-    endpoint = "/rules"
-    data = {
+def _rule_payload(rule_name, list_ids, action, priority, filters, traffic_field):
+    payload = {
         "name": rule_name,
         "description": f"Managed by Cloudflare-Gateway-DNS-Filter ({action})",
         "action": action,
@@ -43,25 +40,23 @@ def create_rule(rule_name, list_ids, action="block", priority=1000,
         "enabled": True,
     }
     if filters:
-        data["filters"] = filters
-    status, response = cloudflare_gateway_request("POST", endpoint, body=json.dumps(data))
+        payload["filters"] = filters
+    return payload
+
+
+@retry(**retry_config)
+def create_rule(rule_name, list_ids, action="block", priority=1000,
+                 filters=None, traffic_field="dns.domains"):
+    data = _rule_payload(rule_name, list_ids, action, priority, filters, traffic_field)
+    status, response = cloudflare_gateway_request("POST", "/rules", body=json.dumps(data))
     return response["result"]
 
 
 @retry(**retry_config)
 def update_rule(rule_name, rule_id, list_ids, action="block", priority=1000,
                  filters=None, traffic_field="dns.domains"):
+    data = _rule_payload(rule_name, list_ids, action, priority, filters, traffic_field)
     endpoint = f"/rules/{rule_id}"
-    data = {
-        "name": rule_name,
-        "description": f"Managed by Cloudflare-Gateway-DNS-Filter ({action})",
-        "action": action,
-        "precedence": priority,
-        "traffic": " or ".join(f'any({traffic_field}[*] in ${lst})' for lst in list_ids),
-        "enabled": True,
-    }
-    if filters:
-        data["filters"] = filters
     status, response = cloudflare_gateway_request("PUT", endpoint, body=json.dumps(data))
     return response["result"]
 
