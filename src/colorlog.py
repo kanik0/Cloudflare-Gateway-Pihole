@@ -2,24 +2,28 @@ import logging
 from datetime import datetime
 import os
 
-class ColoredLevelFormatter(logging.Formatter):
-    COLOR_CODE = {
-        'DEBUG':    "\x1b[36m",
-        'INFO':     "\x1b[0m",
-        'WARNING':  "\x1b[33m",
-        'ERROR':    "\x1b[31m",
-        'CRITICAL': "\x1b[31;1m",
-        'RESET':    "\x1b[0m",
-        'DATE':     "\x1b[32m",
-        'CALLER':   "\x1b[36m"
+
+class IconLevelFormatter(logging.Formatter):
+    """
+    Log formatter that prefixes each line with a level icon instead of
+    relying on ANSI color codes. ANSI colors only look right on terminals
+    with a dark background (and don't render at all in places like the
+    GitHub Actions log viewer set to light mode, some CI dashboards, or
+    when output is piped to a file). Icons are plain Unicode characters,
+    so they show up consistently everywhere text does.
+    """
+
+    LEVEL_ICON = {
+        'DEBUG':    '🐞',
+        'INFO':     'ℹ️ ',
+        'WARNING':  '⚠️ ',
+        'ERROR':    '❌',
+        'CRITICAL': '🔥',
     }
 
     def format(self, record):
         levelname = record.levelname
-        levelname_color = self.COLOR_CODE.get(levelname, "")
-        reset_color = self.COLOR_CODE['RESET']
-        date_color = self.COLOR_CODE['DATE']
-        caller_color = self.COLOR_CODE['CALLER']
+        icon = self.LEVEL_ICON.get(levelname, '•')
 
         current_time = datetime.fromtimestamp(record.created).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
 
@@ -31,20 +35,19 @@ class ColoredLevelFormatter(logging.Formatter):
         original_message = record.getMessage()
 
         formatted_message = (
-            f"{date_color}{current_time}{reset_color} | "
-            f"{levelname_color}{levelname:<8}{reset_color} | "
-            f"{caller_color}{caller_info}{reset_color} - "
-            f"{levelname_color}{original_message}{reset_color}"
+            f"{icon} {current_time} | "
+            f"{caller_info} - "
+            f"{original_message}"
         )
 
         record.msg = formatted_message
         formatted_record = super().format(record)
 
         return formatted_record
-        
+
 
 logging.getLogger().setLevel(logging.INFO)
-formatter = ColoredLevelFormatter()
+formatter = IconLevelFormatter()
 console = logging.StreamHandler()
 console.setFormatter(formatter)
 logger = logging.getLogger()
