@@ -35,10 +35,27 @@ This script manages two sets of Cloudflare Gateway DNS rules in a single workflo
 | :--- | :--- | :--- | :--- |
 | `[AdBlock-DNS-Filters] Block Ads` | block | 1000 | `adlist.ini` + `dynamic_blacklist.txt` |
 | `[AdAllow-DNS-Filters] Allow` | allow | 999 *(higher priority)* | `whitelist.ini` + `dynamic_whitelist.txt` |
+| `[AdBlock-DNS-Filters] Block Ads (SNI)` *(optional)* | block | 1000 | Reuses the block list above |
 
 Because the Allow rule has a **lower precedence number** (999 < 1000), Cloudflare evaluates it first — so whitelisted domains are always resolved even if they appear in a blocklist. There is no need to subtract the whitelist from the block list in code.
 
 The script also enforces Cloudflare Gateway's **free tier limit of 300 lists** across both rules combined. If your sources would require more than 300 lists, the script stops before making any changes.
+
+---
+
+## (Optional) SNI-based blocking — resist DNS bypass
+
+Plain DNS filtering has a blind spot: if a device or app ignores your DNS server (uses its own DNS-over-HTTPS, or connects straight to an IP), it can dodge the filter entirely.
+
+SNI (Server Name Indication) is the domain name sent in cleartext during the TLS handshake, before the connection is encrypted. Enabling SNI filtering makes Gateway inspect that handshake directly instead of relying on DNS — so even if a device bypasses DNS, the connection to a blocked domain still gets cut.
+
+**To enable it:**
+
+1. Set the environment variable / Actions variable `ENABLE_SNI_FILTER` to `true`.
+2. In the Cloudflare Zero Trust dashboard, go to **Settings → Network** and enable **Gateway proxy for TCP**. Without this, the rule exists but has no effect.
+3. Devices must connect through the **WARP client** (Gateway with WARP mode) — just pointing DNS at Cloudflare is not enough for this rule to see the traffic.
+
+The SNI rule reuses the same domain lists as the DNS block rule, so it doesn't consume any extra list quota.
 
 ---
 
@@ -91,6 +108,7 @@ Go to `https://github.com/<username>/Cloudflare-Gateway-DNS-Filter/settings/vari
 | `WHITELIST_URLS` | Space-separated allow list URLs |
 | `DYNAMIC_BLACKLIST` | Extra domains to block (one per line) |
 | `DYNAMIC_WHITELIST` | Extra domains to allow (one per line) |
+| `ENABLE_SNI_FILTER` | Set to `true` to enable the extra SNI-based block rule (see section above) |
 
 * You should add your ad list and whitelist to Action variables. If you update your fork, your custom list will not be lost.
 

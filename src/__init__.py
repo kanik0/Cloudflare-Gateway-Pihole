@@ -8,6 +8,11 @@ BLOCK_PREFIX = "AdBlock-DNS-Filters"
 ALLOW_PREFIX = "AdAllow-DNS-Filters"
 CACHE_FILE = "cloudflare_cache.json"
 
+# SNI-based (network/L4) filtering is opt-in: it requires the device to be
+# connected through the Cloudflare WARP client with the TCP proxy enabled.
+# Without that, this rule has no effect, so we don't create it by default.
+ENABLE_SNI_FILTER = (os.getenv("ENABLE_SNI_FILTER") or "").strip().lower() in ("1", "true", "yes")
+
 # Read .env variables 
 def dot_env(file_path=".env"):
     env_vars = {}

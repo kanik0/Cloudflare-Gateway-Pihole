@@ -1,6 +1,6 @@
 import argparse
 from src.domains import BlockDomainConverter, AllowDomainConverter
-from src import utils, info, silent_error, error, BLOCK_PREFIX, ALLOW_PREFIX
+from src import utils, info, silent_error, error, BLOCK_PREFIX, ALLOW_PREFIX, ENABLE_SNI_FILTER
 from src.cloudflare import (
     create_list, update_list, create_rule,
     update_rule, delete_list, delete_rule
@@ -18,6 +18,7 @@ class CloudflareManager:
         # Block config
         self.block_list_name = f"[{BLOCK_PREFIX}]"
         self.block_rule_name = f"[{BLOCK_PREFIX}] Block Ads"
+        self.block_sni_rule_name = f"[{BLOCK_PREFIX}] Block Ads (SNI)"
 
         # Allow config
         self.allow_list_name = f"[{ALLOW_PREFIX}]"
@@ -26,9 +27,61 @@ class CloudflareManager:
     # ------------------------------------------------------------------
     # Generic list/rule sync (shared by both block and allow)
     # ------------------------------------------------------------------
-    def _sync_lists(self, domains, list_name_prefix, rule_name, rule_action, rule_priority):
-        current_lists = utils.get_current_lists(self.cache, list_name_prefix)
+    def _sync_rule(self, list_ids, rule_name, rule_action, rule_priority,
+                    filters=None, traffic_field="dns.domains"):
         current_rules = utils.get_current_rules(self.cache, rule_name)
+        existing_rule = next((r for r in current_rules if r["name"] == rule_name), None)
+        existing_list_ids = utils.extract_list_ids(existing_rule)
+
+        if existing_rule:
+            if set(list_ids) != existing_list_ids:
+                try:
+                    updated = update_rule(rule_name, existing_rule["id"], list_ids,
+                                          action=rule_action, priority=rule_priority,
+                                          filters=filters, traffic_field=traffic_field)
+                    info(f"[~] Updated rule: {updated['name']}")
+                    self.cache["rules"] = [
+                        r for r in self.cache["rules"] if r["id"] != existing_rule["id"]
+                    ]
+                    self.cache["rules"].append(updated)
+                except NotFoundException:
+                    silent_error(
+                        f"[·] Rule {rule_name} ({existing_rule['id']}) missing on Cloudflare "
+                        f"— evicting from cache and recreating"
+                    )
+                    self.cache["rules"] = [
+                        r for r in self.cache["rules"] if r["id"] != existing_rule["id"]
+                    ]
+                    rule = create_rule(rule_name, list_ids, action=rule_action,
+                                       priority=rule_priority, filters=filters,
+                                       traffic_field=traffic_field)
+                    info(f"[+] Recreated rule: {rule['name']}")
+                    self.cache["rules"].append(rule)
+            else:
+                silent_error(f"[·] Skipping rule update (unchanged): {rule_name}")
+        else:
+            rule = create_rule(rule_name, list_ids, action=rule_action,
+                               priority=rule_priority, filters=filters,
+                               traffic_field=traffic_field)
+            info(f"[+] Created rule: {rule['name']}")
+            self.cache["rules"].append(rule)
+
+        utils.save_cache(self.cache)
+
+    def _delete_rule_by_name(self, rule_name):
+        current_rules = utils.get_current_rules(self.cache, rule_name)
+        for rule in current_rules:
+            try:
+                delete_rule(rule["id"])
+                info(f"[−] Deleted rule: {rule['name']}")
+            except NotFoundException:
+                silent_error(f"[·] Rule {rule['name']} already gone on Cloudflare — skipping")
+            self.cache["rules"] = [r for r in self.cache["rules"] if r["id"] != rule["id"]]
+            utils.save_cache(self.cache)
+
+    def _sync_lists(self, domains, list_name_prefix, rule_name, rule_action, rule_priority,
+                     sni_rule_name=None):
+        current_lists = utils.get_current_lists(self.cache, list_name_prefix)
 
         list_id_to_domains = {}
         for lst in current_lists:
@@ -52,7 +105,7 @@ class CloudflareManager:
         all_indexes = set(range(1, max(existing_indexes + [needed_lists]) + 1))
 
         new_list_ids = []
-        for i in all_indexes:
+        for i in sorted(all_indexes):
             list_name = f"{list_name_prefix} - {i:03d}"
             if list_name in list_name_to_id:
                 list_id = list_name_to_id[list_name]
@@ -61,17 +114,33 @@ class CloudflareManager:
                 chunk = current_values - remove_items
 
                 new_items = []
-                if len(chunk) < 1000:
+                if len(chunk) < 1000 and remaining_domains:
                     needed_items = 1000 - len(chunk)
                     new_items = list(remaining_domains)[:needed_items]
                     chunk.update(new_items)
                     remaining_domains.difference_update(new_items)
 
+                if not chunk:
+                    # Nothing left to keep here — domains shrank enough
+                    # that this list isn't needed at all anymore. Delete
+                    # it outright instead of leaving an empty resource
+                    # (and a stale cache entry that never gets cleaned
+                    # up) sitting around and eating into the 300-list quota.
+                    try:
+                        delete_list(list_id)
+                        info(f"[−] Deleted list: {list_name} (no longer needed)")
+                    except NotFoundException:
+                        silent_error(f"[·] List {list_name} already gone on Cloudflare — skipping")
+                    self.cache["lists"] = [l for l in self.cache["lists"] if l["id"] != list_id]
+                    self.cache["mapping"].pop(list_id, None)
+                    utils.save_cache(self.cache)
+                    continue
+
                 if remove_items or new_items:
                     try:
                         update_list(list_id, remove_items, new_items)
                         info(
-                            f"Updated list: {list_name} "
+                            f"[~] Updated list: {list_name} "
                             f"| Added {len(new_items)}, Removed {len(remove_items)} "
                             f"| Total: {len(chunk)}"
                         )
@@ -81,18 +150,24 @@ class CloudflareManager:
                         # script (e.g. manually on the dashboard). Evict it
                         # and recreate from scratch instead of failing the run.
                         silent_error(
-                            f"List {list_name} ({list_id}) missing on Cloudflare "
+                            f"[·] List {list_name} ({list_id}) missing on Cloudflare "
                             f"— evicting from cache and recreating"
                         )
                         self.cache["lists"] = [l for l in self.cache["lists"] if l["id"] != list_id]
                         self.cache["mapping"].pop(list_id, None)
                         lst = create_list(list_name, list(chunk))
-                        info(f"Recreated list: {lst['name']} with {len(chunk)} domains")
+                        info(f"[+] Recreated list: {lst['name']} with {len(chunk)} domains")
                         self.cache["lists"].append(lst)
                         self.cache["mapping"][lst["id"]] = list(chunk)
                         list_id = lst["id"]
+                    # Only persist when something actually changed — writing
+                    # the whole cache back to disk on every single list,
+                    # even the ones with nothing to do, is what was causing
+                    # a multi-hundred-ms stall per "Skipped (no changes)"
+                    # line once the cache holds hundreds of 1000-domain lists.
+                    utils.save_cache(self.cache)
                 else:
-                    silent_error(f"Skipped (no changes): {list_name} | Total: {len(chunk)}")
+                    silent_error(f"[·] Skipped (no changes): {list_name} | Total: {len(chunk)}")
 
                 new_list_ids.append(list_id)
             else:
@@ -101,46 +176,25 @@ class CloudflareManager:
                     new_items = list(remaining_domains)[:needed_items]
                     remaining_domains.difference_update(new_items)
                     lst = create_list(list_name, new_items)
-                    info(f"Created list: {lst['name']} with {len(new_items)} domains")
+                    info(f"[+] Created list: {lst['name']} with {len(new_items)} domains")
                     self.cache["lists"].append(lst)
                     self.cache["mapping"][lst["id"]] = new_items
+                    utils.save_cache(self.cache)
                     new_list_ids.append(lst["id"])
 
-        # Sync rule
-        cgp_rule = next(
-            (r for r in current_rules if r["name"] == rule_name), None
-        )
-        cgp_list_ids = utils.extract_list_ids(cgp_rule)
+        # Sync the DNS rule
+        self._sync_rule(new_list_ids, rule_name, rule_action, rule_priority)
 
-        if cgp_rule:
-            if set(new_list_ids) != cgp_list_ids:
-                try:
-                    updated = update_rule(rule_name, cgp_rule["id"], new_list_ids,
-                                          action=rule_action, priority=rule_priority)
-                    info(f"Updated rule: {updated['name']}")
-                    self.cache["rules"] = [
-                        r for r in self.cache["rules"] if r["id"] != cgp_rule["id"]
-                    ]
-                    self.cache["rules"].append(updated)
-                except NotFoundException:
-                    silent_error(
-                        f"Rule {rule_name} ({cgp_rule['id']}) missing on Cloudflare "
-                        f"— evicting from cache and recreating"
-                    )
-                    self.cache["rules"] = [
-                        r for r in self.cache["rules"] if r["id"] != cgp_rule["id"]
-                    ]
-                    rule = create_rule(rule_name, new_list_ids,
-                                       action=rule_action, priority=rule_priority)
-                    info(f"Recreated rule: {rule['name']}")
-                    self.cache["rules"].append(rule)
-            else:
-                silent_error(f"Skipping rule update (unchanged): {rule_name}")
-        else:
-            rule = create_rule(rule_name, new_list_ids,
-                               action=rule_action, priority=rule_priority)
-            info(f"Created rule: {rule['name']}")
-            self.cache["rules"].append(rule)
+        # Optional companion Network (L4) rule: blocks by TLS SNI instead of
+        # DNS resolution. Reuses the same domain lists — Cloudflare Zero
+        # Trust lists of type DOMAIN can be referenced from either a DNS
+        # rule (dns.domains) or a Network rule (net.sni.domains). Only takes
+        # effect for devices connected via WARP with the TCP proxy enabled.
+        if sni_rule_name:
+            self._sync_rule(
+                new_list_ids, sni_rule_name, rule_action, rule_priority,
+                filters=["l4"], traffic_field="net.sni.domains",
+            )
 
         utils.save_cache(self.cache)
         return len(new_list_ids)
@@ -153,18 +207,18 @@ class CloudflareManager:
         for rule in current_rules:
             try:
                 delete_rule(rule["id"])
-                info(f"Deleted rule: {rule['name']}")
+                info(f"[−] Deleted rule: {rule['name']}")
             except NotFoundException:
-                silent_error(f"Rule {rule['name']} already gone on Cloudflare — skipping")
+                silent_error(f"[·] Rule {rule['name']} already gone on Cloudflare — skipping")
             self.cache["rules"] = [r for r in self.cache["rules"] if r["id"] != rule["id"]]
             utils.save_cache(self.cache)
 
         for lst in current_lists:
             try:
                 delete_list(lst["id"])
-                info(f"Deleted list: {lst['name']}")
+                info(f"[−] Deleted list: {lst['name']}")
             except NotFoundException:
-                silent_error(f"List {lst['name']} already gone on Cloudflare — skipping")
+                silent_error(f"[·] List {lst['name']} already gone on Cloudflare — skipping")
             self.cache["lists"] = [l for l in self.cache["lists"] if l["id"] != lst["id"]]
             if lst["id"] in self.cache["mapping"]:
                 del self.cache["mapping"][lst["id"]]
@@ -206,6 +260,7 @@ class CloudflareManager:
             self.block_rule_name,
             rule_action="block",
             rule_priority=1000,
+            sni_rule_name=self.block_sni_rule_name if ENABLE_SNI_FILTER else None,
         )
 
         info("=== Syncing ALLOW lists & rule ===")
@@ -221,6 +276,7 @@ class CloudflareManager:
 
     def delete_resources(self):
         info("=== Deleting BLOCK resources ===")
+        self._delete_rule_by_name(self.block_sni_rule_name)
         self._delete_by_prefix(self.block_list_name, self.block_rule_name)
         info("=== Deleting ALLOW resources ===")
         self._delete_by_prefix(self.allow_list_name, self.allow_rule_name)

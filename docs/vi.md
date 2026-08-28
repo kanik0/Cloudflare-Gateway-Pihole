@@ -35,10 +35,27 @@ Script quản lý hai tập rule DNS trên Cloudflare Gateway trong một lần 
 | :--- | :--- | :--- | :--- |
 | `[AdBlock-DNS-Filters] Block Ads` | block | 1000 | `adlist.ini` + `dynamic_blacklist.txt` |
 | `[AdAllow-DNS-Filters] Allow` | allow | 999 *(ưu tiên cao hơn)* | `whitelist.ini` + `dynamic_whitelist.txt` |
+| `[AdBlock-DNS-Filters] Block Ads (SNI)` *(tuỳ chọn)* | block | 1000 | Dùng lại chính list block ở trên |
 
 Vì rule Allow có **số độ ưu tiên thấp hơn** (999 < 1000), Cloudflare đánh giá nó trước — tên miền được cho phép luôn được phân giải kể cả khi nằm trong danh sách chặn. Script không cần trừ whitelist khỏi blocklist nữa.
 
 Script cũng kiểm tra **giới hạn 300 lists** của gói miễn phí Cloudflare Gateway (tính tổng cả block lẫn allow). Nếu vượt quá, script dừng lại trước khi gọi bất kỳ API nào.
+
+---
+
+## (Tuỳ chọn) Chặn thêm theo SNI — chống bypass DNS
+
+Bộ lọc DNS bình thường có một điểm yếu: nếu thiết bị/app không dùng DNS mặc định của mạng (tự đổi sang DNS-over-HTTPS riêng, hoặc gọi thẳng bằng IP), nó **né được** hoàn toàn bộ lọc.
+
+SNI (Server Name Indication) là tên miền được gửi dạng chưa mã hoá ngay trong bước bắt tay TLS, trước khi HTTPS được thiết lập. Bật thêm rule lọc theo SNI nghĩa là Cloudflare Gateway soi thẳng vào bước bắt tay đó, độc lập với DNS — nên dù thiết bị né DNS bằng cách nào, kết nối tới domain bị chặn vẫn bị cắt.
+
+**Cách bật:**
+
+1. Thêm biến môi trường/Actions variable `ENABLE_SNI_FILTER` = `true`.
+2. Vào Cloudflare Zero Trust dashboard → **Settings → Network** → bật **Gateway proxy for TCP**. Thiếu bước này thì rule vẫn được tạo nhưng không có tác dụng gì.
+3. Thiết bị phải kết nối qua **WARP client** (chế độ Gateway with WARP) — chỉ đổi DNS server thôi thì SNI rule sẽ không chạm được vào traffic.
+
+Rule SNI dùng lại đúng list domain của rule block DNS, không tạo thêm list mới nên không tốn thêm hạn mức 300 list.
 
 ---
 
@@ -98,6 +115,7 @@ Vào `https://github.com/<username>/Cloudflare-Gateway-DNS-Filter/settings/varia
 | `WHITELIST_URLS` | Các URL allowlist cách nhau bằng dấu cách |
 | `DYNAMIC_BLACKLIST` | Tên miền chặn thêm, mỗi dòng một tên |
 | `DYNAMIC_WHITELIST` | Tên miền cho phép thêm, mỗi dòng một tên |
+| `ENABLE_SNI_FILTER` | `true` để bật thêm rule chặn theo SNI (xem mục bên trên) |
 
 * Bạn nên thêm danh sách tùy chỉnh vào Action variables để không bị mất khi pull cập nhật repo.
 

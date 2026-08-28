@@ -1,10 +1,11 @@
 import os
-import http.client
-from urllib.parse import urlparse, urljoin
 from configparser import ConfigParser
-from src import info, silent_error, error
+from src import info, silent_error
 from src.convert import convert_to_block_list, convert_to_allow_list
-from src.requests import retry, retry_config, RateLimitException, HTTPException
+from src.requests import (
+    retry, retry_config, get_session,
+    HTTPException, RateLimitException, _parse_retry_after,
+)
 
 
 class BaseDomainConverter:
@@ -36,51 +37,22 @@ class BaseDomainConverter:
     @retry(**retry_config)
     def download_file(self, url, timeout: int = 15, max_redirects: int = 5):
         headers = {"User-Agent": "Mozilla/5.0"}
-        redirects = 0
+        response = get_session().request(
+            "GET", url, headers=headers, timeout=timeout,
+            follow_redirects=True, max_redirects=max_redirects,
+        )
 
-        while True:
-            parsed_url = urlparse(url)
-            path = parsed_url.path or "/"
-            if parsed_url.query:
-                path += f"?{parsed_url.query}"
+        if response.status_code != 200:
+            error_message = f"Failed to download file from {url}, status code: {response.status_code}"
+            silent_error(error_message)
+            if response.status_code == 429:
+                retry_after = _parse_retry_after(response.get_header("Retry-After"))
+                raise RateLimitException(error_message, retry_after=retry_after)
+            raise HTTPException(error_message)
 
-            if parsed_url.scheme == "https":
-                conn = http.client.HTTPSConnection(parsed_url.netloc, timeout=timeout)
-            else:
-                conn = http.client.HTTPConnection(parsed_url.netloc, timeout=timeout)
-
-            try:
-                conn.request("GET", path, headers=headers)
-                response = conn.getresponse()
-
-                if response.status in (301, 302, 303, 307, 308):
-                    location = response.getheader("Location")
-                    response.read()  # drain body before closing/reusing
-                    if not location:
-                        break
-                    redirects += 1
-                    if redirects > max_redirects:
-                        error_message = f"Too many redirects ({redirects}) while downloading {url}"
-                        silent_error(error_message)
-                        raise HTTPException(error_message)
-                    if not urlparse(location).netloc:
-                        location = urljoin(url, location)
-                    url = location
-                    continue
-
-                if response.status != 200:
-                    error_message = f"Failed to download file from {url}, status code: {response.status}"
-                    silent_error(error_message)
-                    if response.status == 429:
-                        raise RateLimitException(error_message)
-                    else:
-                        raise HTTPException(error_message)
-
-                data = response.read().decode("utf-8")
-                info(f"Downloaded file from {url}. File size: {len(data)}")
-                return data
-            finally:
-                conn.close()
+        data = response.text
+        info(f"Downloaded file from {url}. File size: {len(data)}")
+        return data
 
 
 
