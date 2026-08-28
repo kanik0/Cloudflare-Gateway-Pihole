@@ -105,7 +105,7 @@ class CloudflareManager:
         all_indexes = set(range(1, max(existing_indexes + [needed_lists]) + 1))
 
         new_list_ids = []
-        for i in all_indexes:
+        for i in sorted(all_indexes):
             list_name = f"{list_name_prefix} - {i:03d}"
             if list_name in list_name_to_id:
                 list_id = list_name_to_id[list_name]
@@ -114,11 +114,27 @@ class CloudflareManager:
                 chunk = current_values - remove_items
 
                 new_items = []
-                if len(chunk) < 1000:
+                if len(chunk) < 1000 and remaining_domains:
                     needed_items = 1000 - len(chunk)
                     new_items = list(remaining_domains)[:needed_items]
                     chunk.update(new_items)
                     remaining_domains.difference_update(new_items)
+
+                if not chunk:
+                    # Nothing left to keep here — domains shrank enough
+                    # that this list isn't needed at all anymore. Delete
+                    # it outright instead of leaving an empty resource
+                    # (and a stale cache entry that never gets cleaned
+                    # up) sitting around and eating into the 300-list quota.
+                    try:
+                        delete_list(list_id)
+                        info(f"[−] Deleted list: {list_name} (no longer needed)")
+                    except NotFoundException:
+                        silent_error(f"[·] List {list_name} already gone on Cloudflare — skipping")
+                    self.cache["lists"] = [l for l in self.cache["lists"] if l["id"] != list_id]
+                    self.cache["mapping"].pop(list_id, None)
+                    utils.save_cache(self.cache)
+                    continue
 
                 if remove_items or new_items:
                     try:
@@ -147,6 +163,7 @@ class CloudflareManager:
                 else:
                     silent_error(f"[·] Skipped (no changes): {list_name} | Total: {len(chunk)}")
 
+                utils.save_cache(self.cache)
                 new_list_ids.append(list_id)
             else:
                 if remaining_domains:
@@ -157,6 +174,7 @@ class CloudflareManager:
                     info(f"[+] Created list: {lst['name']} with {len(new_items)} domains")
                     self.cache["lists"].append(lst)
                     self.cache["mapping"][lst["id"]] = new_items
+                    utils.save_cache(self.cache)
                     new_list_ids.append(lst["id"])
 
         # Sync the DNS rule
