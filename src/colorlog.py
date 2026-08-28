@@ -26,17 +26,10 @@ class IconLevelFormatter(logging.Formatter):
         icon = self.LEVEL_ICON.get(levelname, '•')
 
         current_time = datetime.fromtimestamp(record.created).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-
-        if os.path.basename(record.pathname) == "__init__.py":
-            caller_info = f"{os.path.basename(os.path.dirname(record.pathname))}:{record.funcName}:{record.lineno}"
-        else:
-            caller_info = f"{record.filename}:{record.funcName}:{record.lineno}"
-
         original_message = record.getMessage()
 
         formatted_message = (
             f"{icon} {current_time} | "
-            f"{caller_info} - "
             f"{original_message}"
         )
 
