@@ -160,10 +160,15 @@ class CloudflareManager:
                         self.cache["lists"].append(lst)
                         self.cache["mapping"][lst["id"]] = list(chunk)
                         list_id = lst["id"]
+                    # Only persist when something actually changed — writing
+                    # the whole cache back to disk on every single list,
+                    # even the ones with nothing to do, is what was causing
+                    # a multi-hundred-ms stall per "Skipped (no changes)"
+                    # line once the cache holds hundreds of 1000-domain lists.
+                    utils.save_cache(self.cache)
                 else:
                     silent_error(f"[·] Skipped (no changes): {list_name} | Total: {len(chunk)}")
 
-                utils.save_cache(self.cache)
                 new_list_ids.append(list_id)
             else:
                 if remaining_domains:
