@@ -127,14 +127,22 @@ class Session:
     """
 
     # Errors that specifically mean "the connection I was holding is no
-    # longer good" — worth a silent reconnect. Genuine timeouts or TLS
-    # failures are not: retrying instantly on those wouldn't help and
-    # should surface to the normal retry/backoff logic instead.
+    # longer good" — worth a silent reconnect. Checked first (see
+    # _NETWORK_ERRORS below) since ConnectionResetError/BrokenPipeError
+    # are themselves OSError subclasses.
     _STALE_CONNECTION_ERRORS = (
         http.client.RemoteDisconnected,
         ConnectionResetError,
         BrokenPipeError,
     )
+
+    # Every other network-level failure: DNS resolution, connection
+    # refused, TLS handshake failure, timeout, etc. These aren't worth
+    # retrying instantly (unlike a stale keep-alive connection), but
+    # they still deserve a clear, logged message that names the method
+    # and URL — the same clarity plain http.client gives you at the
+    # call site — rather than a bare exception bubbling up silently.
+    _NETWORK_ERRORS = (http.client.HTTPException, ssl.SSLError, socket.timeout, OSError)
 
     def __init__(self, default_timeout: int = 20):
         self.default_timeout = default_timeout
@@ -163,6 +171,7 @@ class Session:
         self._connections.clear()
 
     def _request_once(self, scheme, netloc, method, path, body, headers, timeout) -> Response:
+        display_url = f"{scheme}://{netloc}{path}"
         for attempt in (1, 2):
             conn = self._get_connection(scheme, netloc, timeout)
             try:
@@ -171,11 +180,20 @@ class Session:
                 data = raw_response.read()
                 return Response(raw_response.status, raw_response.reason,
                                  raw_response.getheaders(), data)
-            except self._STALE_CONNECTION_ERRORS:
+            except self._STALE_CONNECTION_ERRORS as e:
                 self._drop_connection(scheme, netloc)
                 if attempt == 2:
-                    raise
+                    message = f"Network error while requesting {method} {display_url}: {e}"
+                    silent_error(message)
+                    raise HTTPException(message) from e
                 # else: loop once more on a freshly (re)opened connection
+            except self._NETWORK_ERRORS as e:
+                # A connection that just failed like this shouldn't stay
+                # pooled for the next call to trip over again.
+                self._drop_connection(scheme, netloc)
+                message = f"Network error while requesting {method} {display_url}: {e}"
+                silent_error(message)
+                raise HTTPException(message) from e
 
         raise HTTPException("Unreachable: Session._request_once retry loop exited without a result")
 
@@ -236,13 +254,10 @@ def cloudflare_gateway_request(
     path = f"/client/v4/accounts/{CF_IDENTIFIER}/gateway{endpoint}"
     url = f"https://{CLOUDFLARE_HOST}{path}"
 
-    try:
-        response = get_session().request(method, url, body=body, headers=headers, timeout=timeout)
-    except (http.client.HTTPException, ssl.SSLError, socket.timeout, OSError) as e:
-        # Log and raise a generic HTTP exception for network-related errors
-        error_message = f"Network error occurred: {e}"
-        silent_error(error_message)
-        raise HTTPException(error_message)
+    # Network-level failures (DNS, connection refused, TLS, timeout,
+    # stale keep-alive connection) are already turned into a clear,
+    # logged HTTPException by Session — nothing to catch here.
+    response = get_session().request(method, url, body=body, headers=headers, timeout=timeout)
 
     if response.status_code >= 400:
         error_message = (
