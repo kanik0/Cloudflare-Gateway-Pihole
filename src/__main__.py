@@ -3,7 +3,7 @@ from src.domains import BlockDomainConverter, AllowDomainConverter
 from src import utils, info, silent_error, error, BLOCK_PREFIX, ALLOW_PREFIX, ENABLE_SNI_FILTER
 from src.cloudflare import (
     create_list, update_list, create_rule,
-    update_rule, delete_list, delete_rule
+    update_rule, delete_list, delete_rule, get_rules
 )
 from src.requests import NotFoundException
 
@@ -24,6 +24,63 @@ class CloudflareManager:
         self.allow_list_name = f"[{ALLOW_PREFIX}]"
         self.allow_rule_name = f"[{ALLOW_PREFIX}] Allow"
 
+    def _resolve_rule_priorities(self):
+        """Resolve collision-free Gateway rule precedence values.
+
+        Preserve the existing managed ordering when all required rules are
+        already present and valid. If one is missing (or the ordering is
+        invalid), allocate a fresh consecutive range after every existing
+        Gateway rule so creation/update cannot collide with unrelated rules.
+        """
+        current_rules = get_rules("")
+
+        managed_names = {
+            self.allow_rule_name,
+            self.block_rule_name,
+        }
+        if ENABLE_SNI_FILTER:
+            managed_names.add(self.block_sni_rule_name)
+
+        managed = {
+            rule["name"]: rule
+            for rule in current_rules
+            if rule.get("name") in managed_names
+        }
+
+        allow_rule = managed.get(self.allow_rule_name)
+        block_rule = managed.get(self.block_rule_name)
+        sni_rule = managed.get(self.block_sni_rule_name) if ENABLE_SNI_FILTER else None
+
+        required_rules = [allow_rule, block_rule]
+        if ENABLE_SNI_FILTER:
+            required_rules.append(sni_rule)
+
+        if all(required_rules):
+            managed_precedences = [rule.get("precedence") for rule in required_rules]
+            if (
+                all(isinstance(value, int) for value in managed_precedences)
+                and len(set(managed_precedences)) == len(managed_precedences)
+                and allow_rule["precedence"] < block_rule["precedence"]
+            ):
+                return (
+                    block_rule["precedence"],
+                    allow_rule["precedence"],
+                    sni_rule["precedence"] if sni_rule else None,
+                )
+
+        used_precedences = [
+            rule["precedence"]
+            for rule in current_rules
+            if isinstance(rule.get("precedence"), int)
+        ]
+        first_free = max(1000, max(used_precedences, default=999) + 1)
+
+        allow_priority = first_free
+        block_priority = first_free + 1
+        sni_priority = first_free + 2 if ENABLE_SNI_FILTER else None
+
+        return block_priority, allow_priority, sni_priority
+
     # ------------------------------------------------------------------
     # Generic list/rule sync (shared by both block and allow)
     # ------------------------------------------------------------------
@@ -34,7 +91,8 @@ class CloudflareManager:
         existing_list_ids = utils.extract_list_ids(existing_rule)
 
         if existing_rule:
-            if set(list_ids) != existing_list_ids:
+            precedence_changed = existing_rule.get("precedence") != rule_priority
+            if set(list_ids) != existing_list_ids or precedence_changed:
                 try:
                     updated = update_rule(rule_name, existing_rule["id"], list_ids,
                                           action=rule_action, priority=rule_priority,
@@ -80,7 +138,7 @@ class CloudflareManager:
             utils.save_cache(self.cache)
 
     def _sync_lists(self, domains, list_name_prefix, rule_name, rule_action, rule_priority,
-                     sni_rule_name=None):
+                     sni_rule_name=None, sni_rule_priority=None):
         # --- Fast path: skip entire sync when domain set is unchanged ---
         cached_hash, cached_domains = utils.get_cached_domain_state(self.cache, list_name_prefix)
         current_hash = utils.compute_domain_hash(domains)
@@ -128,7 +186,8 @@ class CloudflareManager:
         # Optional SNI (L4) rule
         if sni_rule_name:
             self._sync_rule(
-                new_list_ids, sni_rule_name, rule_action, rule_priority,
+                new_list_ids, sni_rule_name, rule_action,
+                sni_rule_priority if sni_rule_priority is not None else rule_priority,
                 filters=["l4"], traffic_field="net.sni.domains",
             )
 
@@ -368,6 +427,15 @@ class CloudflareManager:
                 f"Reduce your adlists or whitelist sources."
             )
 
+        block_priority, allow_priority, sni_priority = self._resolve_rule_priorities()
+        priority_msg = (
+            f"Gateway rule precedence → Allow: {allow_priority}, "
+            f"Block: {block_priority}"
+        )
+        if sni_priority is not None:
+            priority_msg += f", SNI Block: {sni_priority}"
+        info(priority_msg)
+
         info("=== Syncing BLOCK lists & rule ===")
         # Allow rule has higher precedence (lower number = higher priority)
         self._sync_lists(
@@ -375,8 +443,9 @@ class CloudflareManager:
             self.block_list_name,
             self.block_rule_name,
             rule_action="block",
-            rule_priority=1000,
+            rule_priority=block_priority,
             sni_rule_name=self.block_sni_rule_name if ENABLE_SNI_FILTER else None,
+            sni_rule_priority=sni_priority,
         )
 
         info("=== Syncing ALLOW lists & rule ===")
@@ -385,7 +454,7 @@ class CloudflareManager:
             self.allow_list_name,
             self.allow_rule_name,
             rule_action="allow",
-            rule_priority=999,   # Lower number = evaluated first → allow wins over block
+            rule_priority=allow_priority,   # Lower number = evaluated first → allow wins over block
         )
 
         info("=== Done ===")
@@ -412,8 +481,8 @@ def main():
 
     if args.action == "run":
         manager.update_resources()
-        if utils.is_running_in_github_actions():
-            utils.delete_cache()
+        # Keep cloudflare_cache.json so actions/cache can persist the successful
+        # state for the next run. Deleting it here made every run a cache miss.
     elif args.action == "leave":
         manager.delete_resources()
     else:
