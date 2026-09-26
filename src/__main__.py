@@ -143,9 +143,20 @@ class CloudflareManager:
         cached_hash, cached_domains = utils.get_cached_domain_state(self.cache, list_name_prefix)
         current_hash = utils.compute_domain_hash(domains)
         if cached_hash is not None and cached_hash == current_hash:
-            info(f"[·] No changes detected for {list_name_prefix} ({len(domains)} domains) — skipping all lists")
+            info(f"[·] No changes detected for {list_name_prefix} ({len(domains)} domains) — skipping list updates")
             current_lists = utils.get_current_lists(self.cache, list_name_prefix)
-            return [lst["id"] for lst in current_lists]
+            current_list_ids = [lst["id"] for lst in current_lists]
+
+            # Lists are unchanged, but rules may have been edited/deleted
+            # outside this script. Always reconcile them before returning.
+            self._sync_rule(current_list_ids, rule_name, rule_action, rule_priority)
+            if sni_rule_name:
+                self._sync_rule(
+                    current_list_ids, sni_rule_name, rule_action,
+                    sni_rule_priority if sni_rule_priority is not None else rule_priority,
+                    filters=["l4"], traffic_field="net.sni.domains",
+                )
+            return current_list_ids
 
         # --- Domains changed: compute diff ---
         to_add, to_remove = utils.get_domain_diff(domains, cached_domains)
